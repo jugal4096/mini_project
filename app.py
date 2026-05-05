@@ -1,13 +1,12 @@
 import streamlit as st
-import joblib
+import sqlite3
+from datetime import datetime
+import pytz
 
-st.set_page_config(page_title="Train Crossing AI", layout="centered")
-
-st.title("🚆 Train Crossing Predictor")
-st.caption("Train 1: Jalna → CPSN | Train 2: CPSN → Jalna")
+st.set_page_config(page_title="Train Crossing AI", layout="wide")
 
 # ------------------------------
-# ROUTE (WITH DINAGAON)
+# ROUTE
 # ------------------------------
 ROUTE = {
     "Jalna": 0,
@@ -15,178 +14,258 @@ ROUTE = {
     "Badnapur": 20,
     "Karmad": 40,
     "Chikalthana": 55,
-    "Aurangabad": 70
+    "CPSN": 70
 }
 
-STATIONS = list(ROUTE.keys())
-LOOP_STATIONS = ["Badnapur", "Karmad", "Chikalthana"]
+LOOP_STATIONS = ["Dinagaon", "Badnapur", "Karmad", "Chikalthana"]
 
 # ------------------------------
-# LOAD MODEL
+# IST TIME
 # ------------------------------
-try:
-    model_decision = joblib.load("model_decision.pkl")
-    model_delay = joblib.load("model_delay.pkl")
-    le_station = joblib.load("le_station.pkl")
-    le_decision = joblib.load("le_decision.pkl")
-except Exception as e:
-    st.error(f"Model loading error: {e}")
-    st.stop()
+def get_now_ist():
+    return datetime.now(pytz.timezone("Asia/Kolkata"))
 
 # ------------------------------
-# PRIORITY
+# FETCH TRAINS
 # ------------------------------
-def priority(t):
-    return {"Passenger": 1, "Express": 2, "Superfast": 3}[t]
+def fetch_trains():
+    conn = sqlite3.connect("trains.db")
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT train_no, name, type, dep_time, avg_speed,
+               runs_sun, runs_mon, runs_tue, runs_wed, runs_thu, runs_fri, runs_sat,
+               direction
+        FROM trains
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    now = get_now_ist()
+    db_index = (now.weekday() + 1) % 7  # FIXED mapping
+
+    trains = []
+
+    for r in rows:
+        running_today = r[5 + db_index] == 1
+
+        h, m = map(int, r[3].split(":"))
+        dep_min = h * 60 + m
+
+        trains.append({
+            "train_no": r[0],
+            "name": r[1],
+            "type": r[2],
+            "dep_min": dep_min,
+            "speed": r[4],
+            "direction": r[12],
+            "running_today": running_today
+        })
+
+    return trains
 
 # ------------------------------
-# POSITION
+# SECTION + TIME LOGIC
 # ------------------------------
-def pos_train1(station, dist):
-    # Jalna → CPSN (forward)
-    return ROUTE[station] - dist
+def section_time(train):
+    return (70 / train["speed"]) * 60
 
-def pos_train2(station, dist):
-    # CPSN → Jalna (reverse)
-    return ROUTE[station] + dist
+def is_in_section_now(train, now_min):
+    end = train["dep_min"] + section_time(train)
+    return train["dep_min"] <= now_min <= end
+
+def will_enter_within_1hr(train, now_min):
+    return now_min < train["dep_min"] <= now_min + 60
+
+def get_position(train, now_min):
+    dt = now_min - train["dep_min"]
+
+    if dt < 0:
+        return None
+
+    dist = (train["speed"] * dt) / 60
+
+    if train["direction"] == "UP":
+        return min(70, dist)
+    else:
+        return max(0, 70 - dist)
+
+def eta(pos, speed, station):
+    dist = abs(ROUTE[station] - pos)
+    return (dist / speed) * 60
 
 # ------------------------------
-# MEETING POINT
+# CONFLICT DETECTION
 # ------------------------------
-def meeting_point(p1, p2):
-    meet = (p1 + p2) / 2
-    station = min(LOOP_STATIONS, key=lambda s: abs(ROUTE[s] - meet))
-    return station, meet
+def find_conflicts(t1, others):
+    results = []
+
+    for t2 in others:
+
+        if t2["direction"] == t1["direction"]:
+            continue
+
+        best_station = None
+        best_diff = 999
+
+        for stn in LOOP_STATIONS:
+            e1 = eta(t1["pos"], t1["speed"], stn)
+            e2 = eta(t2["pos"], t2["speed"], stn)
+
+            diff = abs(e1 - e2)
+
+            if diff < best_diff:
+                best_diff = diff
+                best_station = stn
+
+        if best_diff < 5:  # relaxed for prediction
+            results.append({
+                "train": t2,
+                "station": best_station,
+                "eta_diff": round(best_diff, 2)
+            })
+
+    return sorted(results, key=lambda x: x["eta_diff"])
 
 # ------------------------------
-# NEAREST LOOP
+# DYNAMIC DELAY LOGIC
 # ------------------------------
-def nearest_loop(pos):
-    stn = min(LOOP_STATIONS, key=lambda s: abs(ROUTE[s] - pos))
-    return stn, abs(pos - ROUTE[stn])
+def decide(t1, t2, eta_diff):
 
-# ------------------------------
-# RULE SCORE
-# ------------------------------
-def rule_score(d1, d2, delay1, delay2, p1, p2, prox1, prox2):
-    s1 = s2 = 0
+    priority = {
+        "VB": 5,
+        "SF": 4,
+        "JSHTB": 3,
+        "EXP": 2,
+        "PASS": 1,
+        "DEMU": 1
+    }
 
-    if d1 < d2:
-        s1 += 2
-    elif d2 < d1:
-        s2 += 2
+    p1 = priority.get(t1["type"], 2)
+    p2 = priority.get(t2["type"], 2)
 
-    if prox1 < prox2:
-        s1 += 1
-    elif prox2 < prox1:
-        s2 += 1
+    SAFE_GAP = 4
+
+    delay = max(0, SAFE_GAP - eta_diff)
+    delay = max(delay, 1)
+    delay = min(delay, 15)
 
     if p1 > p2:
-        s1 += 2
+        halt = t2["train_no"]
     elif p2 > p1:
-        s2 += 2
-
-    if delay1 < delay2:
-        s1 += 1
+        halt = t1["train_no"]
     else:
-        s2 += 1
+        halt = t1["train_no"] if t1["speed"] < t2["speed"] else t2["train_no"]
 
-    return s1, s2
-
-# ------------------------------
-# HYBRID DECISION
-# ------------------------------
-def hybrid_decision(ml, s1, s2):
-    if ml == "HALT_TRAIN1":
-        s2 += 2
-    elif ml == "HALT_TRAIN2":
-        s1 += 2
-
-    return "Train 1 PASS, Train 2 HALT" if s1 > s2 else "Train 2 PASS, Train 1 HALT"
-
-# ------------------------------
-# PREDICT
-# ------------------------------
-def predict(t1, t2, s1, s2, d1, d2, delay1, delay2, type1, type2):
-
-    p1 = pos_train1(s1, d1)
-    p2 = pos_train2(s2, d2)
-
-    # must be facing each other
-    if p1 >= p2:
-        return {"info": "No crossing (positions not opposing)"}
-
-    station, meet = meeting_point(p1, p2)
-
-    dist1 = abs(p1 - meet)
-    dist2 = abs(p2 - meet)
-
-    loop1, prox1 = nearest_loop(p1)
-    loop2, prox2 = nearest_loop(p2)
-
-    pr1 = priority(type1)
-    pr2 = priority(type2)
-
-    s1_score, s2_score = rule_score(dist1, dist2, delay1, delay2, pr1, pr2, prox1, prox2)
-
-    if station not in le_station.classes_:
-        return {"error": f"{station} not in model"}
-
-    enc = le_station.transform([station])[0]
-
-    sample = [[t1, t2, enc, delay1]]
-
-    ml = model_decision.predict(sample)
-    ml = le_decision.inverse_transform(ml)[0]
-
-    delay_pred = model_delay.predict(sample)
-
-    final = hybrid_decision(ml, s1_score, s2_score)
-
-    return {
-        "station": station,
-        "meeting_km": round(meet, 2),
-        "ml": ml,
-        "scores": (s1_score, s2_score),
-        "final": final,
-        "delay": int(delay_pred[0])
-    }
+    return halt, round(delay, 2)
 
 # ------------------------------
 # UI
 # ------------------------------
-col1, col2 = st.columns(2)
+st.title("🚆 Train Crossing Predictor")
 
-with col1:
-    st.subheader("🚆 Train 1 (J → CPSN)")
-    t1 = st.number_input("Train 1 No", key="t1")
-    s1 = st.selectbox("Approaching Station", STATIONS, key="s1")
-    d1 = st.slider("Distance (km)", 0, 20, key="d1")
-    delay1 = st.slider("Delay", 0, 60, key="delay1")
-    type1 = st.selectbox("Type", ["Passenger", "Express", "Superfast"], key="type1")
+now = get_now_ist()
+now_min = now.hour * 60 + now.minute
 
-with col2:
-    st.subheader("🚆 Train 2 (CPSN → J)")
-    t2 = st.number_input("Train 2 No", key="t2")
-    s2 = st.selectbox("Approaching Station", STATIONS, key="s2")
-    d2 = st.slider("Distance (km)", 0, 20, key="d2")
-    delay2 = st.slider("Delay", 0, 60, key="delay2")
-    type2 = st.selectbox("Type", ["Passenger", "Express", "Superfast"], key="type2")
+st.write(f"🕒 IST Time: {now.strftime('%H:%M')}")
 
-if st.button("⚡ Predict Crossing"):
+direction_filter = st.radio(
+    "Select Direction",
+    ["UP (CPSN → Jalna)", "DOWN (Jalna → CPSN)"]
+)
 
-    result = predict(t1, t2, s1, s2, d1, d2, delay1, delay2, type1, type2)
+selected_direction = "UP" if "UP" in direction_filter else "DOWN"
 
-    if "info" in result:
-        st.info(result["info"])
-    elif "error" in result:
-        st.error(result["error"])
+all_trains = fetch_trains()
+visible_trains = [t for t in all_trains if t["direction"] == selected_direction]
+
+if "selected_train" not in st.session_state:
+    st.session_state.selected_train = None
+
+# ------------------------------
+# TRAIN LIST
+# ------------------------------
+for i, t in enumerate(visible_trains):
+
+    col1, col2, col3 = st.columns([2,6,1])
+
+    col1.write(f"🚆 {t['train_no']}")
+
+    if not t["running_today"]:
+        col2.markdown(f"<span style='color:gray'>{t['name']} — ❌ Not Running Today</span>", unsafe_allow_html=True)
+
+    elif is_in_section_now(t, now_min):
+        col2.write(f"{t['name']} — ✅ In Section")
+
+    elif will_enter_within_1hr(t, now_min):
+        col2.markdown(f"<span style='color:blue'>{t['name']} — 🔵 Entering Soon</span>", unsafe_allow_html=True)
+
     else:
-        st.success("Prediction Complete")
+        col2.markdown(f"<span style='color:orange'>{t['name']} — ⚠️ Not in Section</span>", unsafe_allow_html=True)
 
-        st.write(f"📍 Crossing Station: **{result['station']}**")
-        st.write(f"📏 Meeting Point: **{result['meeting_km']} km**")
-        st.write(f"🤖 ML Decision: {result['ml']}")
-        st.write(f"⚖️ Scores: T1={result['scores'][0]}, T2={result['scores'][1]}")
-        st.write(f"🚦 Final Decision: {result['final']}")
-        st.write(f"⏱ Delay: {result['delay']} min")
+    if col3.button("Analyze", key=f"{t['train_no']}_{i}"):
+        if not t["running_today"]:
+            st.warning("Train not running today")
+        else:
+            st.session_state.selected_train = t["train_no"]
+
+# ------------------------------
+# ANALYSIS
+# ------------------------------
+if st.session_state.selected_train:
+
+    selected = next((x for x in all_trains if x["train_no"] == st.session_state.selected_train), None)
+
+    if selected:
+
+        st.divider()
+        st.subheader(f"🔍 Analysis: {selected['train_no']}")
+
+        pos = get_position(selected, now_min)
+
+        if pos is None:
+            pos = 0 if selected["direction"] == "UP" else 70
+
+        selected["pos"] = pos
+
+        st.success(f"📍 Estimated Position: {round(pos,2)} km")
+
+        valid = []
+
+        for t2 in all_trains:
+
+            if not t2["running_today"]:
+                continue
+
+            if t2["direction"] == selected["direction"]:
+                continue
+
+            if not (is_in_section_now(t2, now_min) or will_enter_within_1hr(t2, now_min)):
+                continue
+
+            pos2 = get_position(t2, now_min)
+
+            if pos2 is None:
+                pos2 = 0 if t2["direction"] == "UP" else 70
+
+            t2_copy = dict(t2)
+            t2_copy["pos"] = pos2
+
+            valid.append(t2_copy)
+
+        conflicts = find_conflicts(selected, valid)
+
+        if not conflicts:
+            st.success("✅ No crossing conflict")
+
+        else:
+            main = conflicts[0]
+            halt, delay = decide(selected, main["train"], main["eta_diff"])
+
+            st.error("🚨 PRIMARY CONFLICT")
+            st.write(f"⚔️ Train: {main['train']['train_no']}")
+            st.write(f"📍 Station: {main['station']}")
+            st.write(f"⏱ ETA diff: {main['eta_diff']} min")
+            st.write(f"🚦 Halt: {halt}")
+            st.write(f"⏳ Delay: {delay} min")
